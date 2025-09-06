@@ -401,7 +401,7 @@ function Get-AuditCertificateTemplate {
     if($ShowAllVulnerableTemplates) {
         ForEach($CATemplate in $Templates) {
             $CATemplateACL = $CATemplate | Get-CertificateTemplateAcl
-            $DACLString = (($CATemplateACL.Access | ForEach-Object { "$($_.IdentityReference) ($($_.AccessControlType)) - $($_.Rights)"}) -join "`n")
+            $DACLString = Get-CertificateTemplateDACLString -TemplateDistinguishedName $CATemplate.DistinguishedName
             $IsTemplateACLVulnerable = Test-IsCertificateTemplateACLVulnerable $CATemplateACL
             $CanLowPrivEnrollInTemplate = Test-CanLowPrivEnrollInTemplate -TemplateDistinguishedName $CATemplate.DistinguishedName
             $EnrolleeSuppliesSubject = $CATemplate.Settings.SubjectName.HasFlag([PKI.CertificateTemplates.CertificateTemplateNameFlags]::EnrolleeSuppliesSubject)
@@ -454,7 +454,7 @@ function Get-AuditCertificateTemplate {
             try {
                 ForEach($CATemplate in $CATemplates) {
                     $CATemplateACL = $CATemplate | Get-CertificateTemplateAcl
-                    $DACLString = (($CATemplateACL.Access | ForEach-Object { "$($_.IdentityReference) ($($_.AccessControlType)) - $($_.Rights)"}) -join "`n")
+                    $DACLString = Get-CertificateTemplateDACLString -TemplateDistinguishedName $CATemplate.DistinguishedName
                     $IsTemplateACLVulnerable = Test-IsCertificateTemplateACLVulnerable $CATemplateACL
                     $CanLowPrivEnrollInTemplate = Test-CanLowPrivEnrollInTemplate -TemplateDistinguishedName $CATemplate.DistinguishedName
                     $EnrolleeSuppliesSubject = $CATemplate.Settings.SubjectName.HasFlag([PKI.CertificateTemplates.CertificateTemplateNameFlags]::EnrolleeSuppliesSubject)
@@ -726,6 +726,47 @@ function Test-CanLowPrivEnrollInTemplate {
     return $False
 }
 
+
+function Get-CertificateTemplateDACLString {
+    <#
+    .SYNOPSIS
+    
+    Builds a human-readable DACL string for a certificate template using ActiveDirectory.
+    
+    License: Ms-PL
+    Required Dependencies: ActiveDirectory
+    
+    .PARAMETER TemplateDistinguishedName
+    The DN of the certificate template.
+    #>
+    [CmdletBinding()]
+    Param(
+        [Parameter(Position=0, Mandatory=$True)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $TemplateDistinguishedName
+    )
+
+    $AdObj = Get-ADObject -Identity $TemplateDistinguishedName -Properties nTSecurityDescriptor
+    $Sd = $AdObj.nTSecurityDescriptor
+    $Dacl = $Sd.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+
+    $lines = @()
+    foreach($Ace in $Dacl) {
+        $rights = $Ace.ActiveDirectoryRights
+        $type = $Ace.AccessControlType
+
+        $sid = $Ace.IdentityReference.Value
+        $ntName = $null
+        try { $ntName = ($Ace.IdentityReference.Translate([System.Security.Principal.NTAccount])).Value } catch {}
+
+        if(-not [string]::IsNullOrEmpty($ntName)) { $idStr = $ntName } else { $idStr = $sid }
+
+        $lines += ("$idStr ($type) - $rights")
+    }
+
+    return ($lines -join "`n")
+}
 
 function Test-UserSpecifiesSAN {
     <#
