@@ -403,7 +403,7 @@ function Get-AuditCertificateTemplate {
             $CATemplateACL = $CATemplate | Get-CertificateTemplateAcl
             $DACLString = (($CATemplateACL.Access | ForEach-Object { "$($_.IdentityReference) ($($_.AccessControlType)) - $($_.Rights)"}) -join "`n")
             $IsTemplateACLVulnerable = Test-IsCertificateTemplateACLVulnerable $CATemplateACL
-            $CanLowPrivEnrollInTemplate = Test-CanLowPrivEnrollInTemplate $CATemplateACL
+            $CanLowPrivEnrollInTemplate = Test-CanLowPrivEnrollInTemplate -TemplateDistinguishedName $CATemplate.DistinguishedName
             $EnrolleeSuppliesSubject = $CATemplate.Settings.SubjectName.HasFlag([PKI.CertificateTemplates.CertificateTemplateNameFlags]::EnrolleeSuppliesSubject)
 
             # Client Authentication - 1.3.6.1.5.5.7.3.2
@@ -456,7 +456,7 @@ function Get-AuditCertificateTemplate {
                     $CATemplateACL = $CATemplate | Get-CertificateTemplateAcl
                     $DACLString = (($CATemplateACL.Access | ForEach-Object { "$($_.IdentityReference) ($($_.AccessControlType)) - $($_.Rights)"}) -join "`n")
                     $IsTemplateACLVulnerable = Test-IsCertificateTemplateACLVulnerable $CATemplateACL
-                    $CanLowPrivEnrollInTemplate = Test-CanLowPrivEnrollInTemplate $CATemplateACL
+                    $CanLowPrivEnrollInTemplate = Test-CanLowPrivEnrollInTemplate -TemplateDistinguishedName $CATemplate.DistinguishedName
                     $EnrolleeSuppliesSubject = $CATemplate.Settings.SubjectName.HasFlag([PKI.CertificateTemplates.CertificateTemplateNameFlags]::EnrolleeSuppliesSubject)
 
                     # Client Authentication - 1.3.6.1.5.5.7.3.2
@@ -617,33 +617,109 @@ function Test-IsCertificateAuthorityACLVulnerable {
 }
 
 
+function Get-AdminSids {
+    <#
+    .SYNOPSIS
+    
+    Returns a set of SIDs considered administrative/privileged in the forest.
+    
+    License: Ms-PL
+    Required Dependencies: ActiveDirectory
+    #>
+    [CmdletBinding()]
+    Param()
+
+    $adminSids = New-Object 'System.Collections.Generic.HashSet[string]'
+
+    # Built-in well-known SIDs
+    $null = $adminSids.Add('S-1-5-9')           # Enterprise Domain Controllers
+    $null = $adminSids.Add('S-1-5-32-544')     # BUILTIN\Administrators
+
+    # Current domain
+    $currentDomain = Get-ADDomain
+    $currentDomainSid = $currentDomain.DomainSID.Value
+
+    foreach($rid in 500, 502, 512, 516, 521) {
+        $null = $adminSids.Add("$currentDomainSid-$rid")
+    }
+
+    # Forest root domain groups
+    $forest = Get-ADForest
+    $rootDomain = Get-ADDomain -Identity $forest.RootDomain
+    $rootSid = $rootDomain.DomainSID.Value
+
+    foreach($rid in 498, 518, 519) {
+        $null = $adminSids.Add("$rootSid-$rid")
+    }
+
+    # Expand members (recursive) for all known admin group SIDs
+    $groupSids = @(
+        "$currentDomainSid-512", # Domain Admins
+        "$currentDomainSid-516", # Domain Controllers
+        "$currentDomainSid-521", # Read-only Domain Controllers
+        "$rootSid-498",          # Enterprise Read-only Domain Controllers
+        "$rootSid-518",          # Schema Admins
+        "$rootSid-519"           # Enterprise Admins
+    )
+
+    foreach($gSid in $groupSids) {
+        try {
+            foreach($m in (Get-ADGroupMember -Identity $gSid -Recursive -ErrorAction Stop)) {
+                if($null -ne $m.SID) { $null = $adminSids.Add($m.SID.Value) }
+            }
+        } catch {
+            # Group might not exist in this environment; ignore
+        }
+    }
+
+    return [string[]]$adminSids
+}
+
+
 function Test-CanLowPrivEnrollInTemplate {
     <#
     .SYNOPSIS
     
     Returns true if default low privileged principals can enroll in a template.
-
+    Implements MS-CRTD processing rules for enroll rights.
+    
     License: Ms-PL
-    Required Dependencies: PSPKI
+    Required Dependencies: ActiveDirectory
+    
+    .PARAMETER TemplateDistinguishedName
 
-    .PARAMETER TemplateACL
-
-    The certificate template ACL to audit.
+    Distinguished name of the template to read raw AD ACL for precise ACE checks.
     #>
     [CmdletBinding()]
     Param(
         [Parameter(Position=0, Mandatory=$True)]
-        [SysadminsLV.PKI.Security.AccessControl.CertTemplateSecurityDescriptor]
-        $TemplateACL
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $TemplateDistinguishedName
     )
     
-    ForEach($Ace in $TemplateACL.Access) {
-        if(
-            ($Ace.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) -and 
-            ( (ConvertName-ToSid $Ace.IdentityReference) -match $CommonLowprivPrincipals) -and 
-            ($Ace.Rights.HasFlag([SysadminsLV.PKI.Security.AccessControl.CertTemplateRights]::Enroll))
-        ) {
-            return $True
+    $AdObj = Get-ADObject -Identity $TemplateDistinguishedName -Properties nTSecurityDescriptor
+    $Sd = $AdObj.nTSecurityDescriptor
+    $Dacl = $Sd.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+    $EnrollGuid = [Guid]'0e10c968-78fb-11d2-90d4-00c04f79dc55'
+    $ZeroGuid = [Guid]'00000000-0000-0000-0000-000000000000'
+    $AdminSids = Get-AdminSids
+
+    foreach($Ace in $Dacl) {
+        # Only consider allow ACEs for low-privileged principals
+        if($Ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+
+        $AceSid = $Ace.IdentityReference.Value
+        if($AdminSids -contains $AceSid) { continue }
+
+        # Access mask must include ExtendedRight
+        $HasExtendedRight = $Ace.ActiveDirectoryRights.HasFlag([System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight)
+        if(-not $HasExtendedRight) { continue }
+
+        # Evaluate ObjectType handling Enroll GUID and zero-GUID (non-object ACE)
+        if($Ace.ObjectType -ne $null) {
+            if(($Ace.ObjectType -eq $EnrollGuid) -or ($Ace.ObjectType -eq $ZeroGuid)) { return $true }
+            continue
         }
     }
 
